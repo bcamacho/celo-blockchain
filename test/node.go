@@ -31,11 +31,10 @@ import (
 
 var (
 	baseNodeConfig *node.Config = &node.Config{
-		Name:    "autonity",
+		Name:    "celo",
 		Version: params.Version,
 		P2P: p2p.Config{
-			MaxPeers:              100,
-			DialHistoryExpiration: time.Millisecond,
+			MaxPeers: 100,
 		},
 		NoUSB:    true,
 		HTTPHost: "0.0.0.0",
@@ -66,6 +65,14 @@ type Node struct {
 	SentTxs []*types.Transaction
 }
 
+func NewConfig() (*node.Config, error) {
+	// Copy the base node config, so we can modify it without damaging the
+	// original.
+	c := &node.Config{}
+	err := copyNodeConfig(baseNodeConfig, c)
+	return c, err
+}
+
 // NewNode creates a new running node as the given user with the provided
 // genesis.
 //
@@ -74,21 +81,25 @@ type Node struct {
 // port the node bound on till after starting if using the 0 port. This means
 // that we have to predefine ports in the genesis, which could cause problems
 // if anything is already bound on that port.
-func NewNode(genesis *core.Genesis) (*Node, error) {
+func NewNode(account *env.Account, config *node.Config) (*Node, error) {
 
-	k := u.Key.(*ecdsa.PrivateKey)
-	address := crypto.PubkeyToAddress(k.PublicKey)
+	// env := gen.LocalEnv{}
 
-	// Copy the base node config, so we can modify it without damaging the
-	// original.
-	c := &node.Config{}
-	err := copyNodeConfig(baseNodeConfig, c)
-	if err != nil {
-		return nil, err
-	}
+	// c, err := env.CreateConfig()
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// c.Accounts.ValidatorAccounts()[0].
+	// g, err := env.CreateGenesisConfig(c)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	k := account.PrivateKey
+	address := account.Address
 
 	// p2p key and address
-	c.P2P.PrivateKey = u.Key.(*ecdsa.PrivateKey)
+	c.P2P.PrivateKey = k
 	c.P2P.ListenAddr = "0.0.0.0:" + strconv.Itoa(u.NodePort)
 
 	// Set rpc ports
@@ -284,8 +295,19 @@ func NewNetworkFromUsers(accounts *env.AccountsConfig) (Network, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// nodekey, err := crypto.LoadECDSA(n.keyFile())
+	// if err != nil {
+	// 	return "", err
+	// }
+	// ip := net.IP{127, 0, 0, 1}
+	// en := enode.NewV4(&nodekey.PublicKey, ip, int(n.NodePort()), int(n.NodePort()))
+	// return en.URLv4(), nil
 	validatorAccounts := c.Accounts.ValidatorAccounts()
 	network := make([]*Node, len(validatorAccounts))
+	for i, a := range validatorAccounts {
+
+	}
 	for i, a := range validatorAccounts {
 		n, err := NewNode(a, g)
 		if err != nil {
@@ -305,7 +327,7 @@ func NewNetworkFromUsers(accounts *env.AccountsConfig) (Network, error) {
 
 // NewNetwork generates a network of nodes that are running, but not mining.
 // For an explanation of the parameters see 'Users'.
-func NewNetwork(count int, formatString string, startingPort int) (Network, error) {
+func NewNetwork(count int) (Network, error) {
 	users, err := Users(count, formatString, startingPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build users: %v", err)
