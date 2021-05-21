@@ -169,6 +169,7 @@ func (n *Node) Start() error {
 	}
 	ethConfigCopy.Miner.Validator = n.Address
 	ethConfigCopy.TxFeeRecipient = n.Address
+	ethConfigCopy.Istanbul.AnnounceQueryEnodeGossipPeriod = 60
 	// n.Eth, err = eth.New(n.Node, ethConfigCopy, nil)
 	// if err != nil {
 	// 	return err
