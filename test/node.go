@@ -14,6 +14,8 @@ import (
 
 	ethereum "github.com/celo-org/celo-blockchain"
 	// "github.com/celo-org/celo-blockchain/cmd/gengen/gengen"
+
+	"github.com/celo-org/celo-blockchain/accounts/keystore"
 	"github.com/celo-org/celo-blockchain/common"
 	"github.com/celo-org/celo-blockchain/core"
 	"github.com/celo-org/celo-blockchain/core/types"
@@ -39,6 +41,7 @@ var (
 		NoUSB:    true,
 		HTTPHost: "0.0.0.0",
 		WSHost:   "0.0.0.0",
+		//	InsecureUnlockAllowed: true,
 	}
 
 	baseEthConfig = &eth.Config{
@@ -81,7 +84,7 @@ func NewConfig() (*node.Config, error) {
 // port the node bound on till after starting if using the 0 port. This means
 // that we have to predefine ports in the genesis, which could cause problems
 // if anything is already bound on that port.
-func NewNode(account *env.Account, config *node.Config) (*Node, error) {
+func NewNode(c *NodeConfig, genesis *core.Genesis) (*Node, error) {
 
 	// env := gen.LocalEnv{}
 
@@ -95,17 +98,11 @@ func NewNode(account *env.Account, config *node.Config) (*Node, error) {
 	// 	return nil, err
 	// }
 
-	k := account.PrivateKey
-	address := account.Address
+	k := c.PrivateKey
+	address := c.Address
 
 	// p2p key and address
 	c.P2P.PrivateKey = k
-	c.P2P.ListenAddr = "0.0.0.0:" + strconv.Itoa(u.NodePort)
-
-	// Set rpc ports
-	userCount := len(genesis.Config.AutonityContractConfig.Users)
-	c.HTTPPort = u.NodePort + userCount
-	c.WSPort = u.NodePort + userCount*2
 
 	datadir, err := ioutil.TempDir("", "autonity_datadir")
 	if err != nil {
@@ -123,13 +120,12 @@ func NewNode(account *env.Account, config *node.Config) (*Node, error) {
 	// Set the min gas price on the mining pool config, otherwise the miner
 	// starts with a default min gas price. Which causes transactions to be
 	// dropped.
-	ec.Miner.GasPrice = (&big.Int{}).SetUint64(genesis.Config.AutonityContractConfig.MinGasPrice)
+	// ec.Miner.GasPrice = (&big.Int{}).SetUint64(genesis.Config.AutonityContractConfig.MinGasPrice)
 	ec.Genesis = genesis
 	ec.NetworkId = genesis.Config.ChainID.Uint64()
-	ec.Tendermint = *genesis.Config.Tendermint
 
 	node := &Node{
-		Config:    c,
+		Config:    c.Config,
 		EthConfig: ec,
 		Key:       k,
 		Address:   address,
@@ -151,6 +147,8 @@ func (n *Node) Start() error {
 		return err
 	}
 
+	// ks := keystore.NewKeyStore(path.Join(n.Config.DataDir, "keystore"), keystore.LightScryptN, keystore.LightScryptP)
+
 	// Give this logger context based on the node address so that we can easily
 	// trace single node execution in the logs. We set the logger only on the
 	// copy, since it is not useful for black box testing and it is also not
@@ -169,19 +167,48 @@ func (n *Node) Start() error {
 	if err != nil {
 		return err
 	}
-	n.Eth, err = eth.New(n.Node, ethConfigCopy, nil)
-	if err != nil {
-		return err
-	}
-	_, _, err = core.SetupGenesisBlock(n.Eth.ChainDb(), n.EthConfig.Genesis)
-	if err != nil {
-		return err
-	}
+	ethConfigCopy.Miner.Validator = n.Address
+	ethConfigCopy.TxFeeRecipient = n.Address
+	// n.Eth, err = eth.New(n.Node, ethConfigCopy, nil)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// Register eth service
+	err = n.Register(func(ctx *node.ServiceContext) (node.Service, error) {
+		return eth.New(ctx, ethConfigCopy)
+	})
+
 	err = n.Node.Start()
 	if err != nil {
 		return err
 	}
-	n.WsClient, err = ethclient.Dial(n.WSEndpoint())
+	ks := n.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
+	// passwords := utils.MakePasswordList(ctx)
+	// for i, account := range unlocks {
+	// 	unlockAccount(ks, account, i, passwords)
+	// }
+
+	account, err := ks.ImportECDSA(n.Key, "")
+	if err != nil {
+		return err
+	}
+	err = ks.TimedUnlock(account, "", 0)
+	if err != nil {
+		return err
+	}
+
+	err = n.Service(&n.Eth)
+	if err != nil {
+		return err
+	}
+
+	_, _, err = core.SetupGenesisBlock(n.Eth.ChainDb(), n.EthConfig.Genesis)
+	if err != nil {
+		return err
+	}
+
+	n.WsClient, err = ethclient.Dial("ws://" + n.WSEndpoint())
 	if err != nil {
 		return err
 	}
@@ -274,11 +301,24 @@ func (n *Node) TxFee(ctx context.Context, tx *types.Transaction) (*big.Int, erro
 // create, start and stop a collection of nodes.
 type Network []*Node
 
+type NodeConfig struct {
+	*env.Account
+	*node.Config
+}
+
+func NewNodeConfig(account *env.Account) *NodeConfig {
+	confCopy := *baseNodeConfig
+	return &NodeConfig{
+		Account: account,
+		Config:  &confCopy,
+	}
+}
+
 // NewNetworkFromUsers generates a network of nodes that are running and
 // mining. For each provided user a corresponding node is created. If there is
 // an error it will be returned immediately, meaning that some nodes may be
 // running and others not.
-func NewNetworkFromUsers(accounts *env.AccountsConfig) (Network, error) {
+func NewNetworkFromUsers(startingPort int) (Network, error) {
 
 	// genesis.GenerateGenesis(accounts, cfg *genesis.Config, contractsBuildPath string)
 	local := genesis.LocalEnv{}
@@ -291,25 +331,32 @@ func NewNetworkFromUsers(accounts *env.AccountsConfig) (Network, error) {
 		return nil, err
 	}
 
-	g, err := genesis.GenerateGenesis(&c.Accounts, gc, "")
+	g, err := genesis.GenerateGenesis(&c.Accounts, gc, "../../celo-monorepo/packages/protocol/build/contracts")
 	if err != nil {
 		return nil, err
 	}
 
-	// nodekey, err := crypto.LoadECDSA(n.keyFile())
-	// if err != nil {
-	// 	return "", err
-	// }
-	// ip := net.IP{127, 0, 0, 1}
-	// en := enode.NewV4(&nodekey.PublicKey, ip, int(n.NodePort()), int(n.NodePort()))
-	// return en.URLv4(), nil
+	// nodePort := starting
 	validatorAccounts := c.Accounts.ValidatorAccounts()
-	network := make([]*Node, len(validatorAccounts))
+	num := len(validatorAccounts)
+	nodeConfig := make([]*NodeConfig, num)
 	for i, a := range validatorAccounts {
+		conf := NewNodeConfig(&a)
+		nodePort := startingPort + (i * 3)
+		conf.P2P.ListenAddr = "0.0.0.0:" + strconv.Itoa(nodePort)
 
+		// Set rpc ports
+		conf.HTTPPort = nodePort + 1
+		conf.WSPort = nodePort + 2
+		nodeConfig[i] = conf
+
+		// ip := net.IP{127, 0, 0, 1}
+		// enodes[i] = enode.NewV4(&a.PrivateKey.PublicKey, ip, int(startingPort), int(startingPort))
 	}
-	for i, a := range validatorAccounts {
-		n, err := NewNode(a, g)
+
+	network := make([]*Node, len(nodeConfig))
+	for i := range nodeConfig {
+		n, err := NewNode(nodeConfig[i], g)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build node for network: %v", err)
 		}
@@ -327,13 +374,13 @@ func NewNetworkFromUsers(accounts *env.AccountsConfig) (Network, error) {
 
 // NewNetwork generates a network of nodes that are running, but not mining.
 // For an explanation of the parameters see 'Users'.
-func NewNetwork(count int) (Network, error) {
-	users, err := Users(count, formatString, startingPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build users: %v", err)
-	}
-	return NewNetworkFromUsers(users)
-}
+// func NewNetwork(count, startingPort int) (Network, error) {
+// 	users, err := Users(count, formatString, startingPort)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to build users: %v", err)
+// 	}
+// 	return NewNetworkFromUsers(users)
+// }
 
 // AwaitTransactions ensures that the entire network has processed the provided transactions.
 func (n Network) AwaitTransactions(ctx context.Context, txs ...*types.Transaction) error {
@@ -378,7 +425,7 @@ func ValueTransferTransaction(client *ethclient.Client, senderKey *ecdsa.Private
 	}
 
 	// Create the transaction and sign it
-	rawTx := types.NewTransaction(nonce, recipient, value, gasLimit, gasPrice, nil)
+	rawTx := types.NewTransactionEthCompatible(nonce, recipient, value, gasLimit, gasPrice, nil)
 	signed, err := types.SignTx(rawTx, types.HomesteadSigner{}, senderKey)
 	if err != nil {
 		return nil, err
@@ -392,30 +439,30 @@ func ValueTransferTransaction(client *ethclient.Client, senderKey *ecdsa.Private
 // package see the variable 'userDescription' in the gengen package for a
 // detailed description of the meaning of the format string.
 // E.G. for a validator '10e18,v,1,0.0.0.0:%s,%s'.
-func Users(count int, formatString string, startingPort int) ([]*gengen.User, error) {
-	var users []*gengen.User
-	for i := startingPort; i < startingPort+count; i++ {
+// func Users(count int, formatString string, startingPort int) ([]*gengen.User, error) {
+// 	var users []*gengen.User
+// 	for i := startingPort; i < startingPort+count; i++ {
 
-		portString := strconv.Itoa(i)
-		u, err := gengen.ParseUser(fmt.Sprintf(formatString, portString, "key"+portString))
-		if err != nil {
-			return nil, err
-		}
-		users = append(users, u)
-	}
-	return users, nil
-}
+// 		portString := strconv.Itoa(i)
+// 		u, err := gengen.ParseUser(fmt.Sprintf(formatString, portString, "key"+portString))
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		users = append(users, u)
+// 	}
+// 	return users, nil
+// }
 
-// Genesis creates a genesis instance from the provided users.
-func Genesis(users []*gengen.User) (*core.Genesis, error) {
-	g, err := gengen.NewGenesis(1, users)
-	if err != nil {
-		return nil, err
-	}
-	// Make the tests fast
-	g.Config.Tendermint.BlockPeriod = 0
-	return g, nil
-}
+// // Genesis creates a genesis instance from the provided users.
+// func Genesis(users []*gengen.User) (*core.Genesis, error) {
+// 	g, err := gengen.NewGenesis(1, users)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	// Make the tests fast
+// 	g.Config.Tendermint.BlockPeriod = 0
+// 	return g, nil
+// }
 
 // Since the node config is not marshalable by default we construct a
 // marshalable struct which we marshal and unmarshal and then unpack into the
