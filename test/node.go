@@ -86,6 +86,7 @@ func NewConfig() (*node.Config, error) {
 // if anything is already bound on that port.
 func NewNode(c *NodeConfig, genesis *core.Genesis) (*Node, error) {
 
+	println("building node", time.Now().String())
 	// env := gen.LocalEnv{}
 
 	// c, err := env.CreateConfig()
@@ -138,6 +139,7 @@ func NewNode(c *NodeConfig, genesis *core.Genesis) (*Node, error) {
 // This creates the node.Node and eth.Ethereum and starts the node.Node and
 // starts eth.Ethereum mining.
 func (n *Node) Start() error {
+	println("starting node", time.Now().String())
 	// Provide a copy of the config to node.New, so that we can rely on
 	// Node.Config field not being manipulated by node and hence use our copy
 	// for black box testing.
@@ -190,14 +192,17 @@ func (n *Node) Start() error {
 	// 	unlockAccount(ks, account, i, passwords)
 	// }
 
+	start := time.Now()
 	account, err := ks.ImportECDSA(n.Key, "")
 	if err != nil {
 		return err
 	}
+	println("import", time.Since(start).String())
 	err = ks.TimedUnlock(account, "", 0)
 	if err != nil {
 		return err
 	}
+	println("unlock", time.Since(start).String())
 
 	err = n.Service(&n.Eth)
 	if err != nil {
@@ -221,7 +226,9 @@ func (n *Node) Start() error {
 	if err != nil {
 		return err
 	}
-	return n.Eth.StartMining(1)
+	err = n.Eth.StartMining(1)
+	println("started node", time.Now().String())
+	return err
 }
 
 // Close shuts down the node and releases all resources and removes the datadir
